@@ -2,11 +2,13 @@ SELECT
   (@rownum:=@rownum+1)              AS '№',
   p.field_298                       AS 'Наименование',
   items.field_424                   AS 'Количество',
-  items.field_425                   AS 'Цена',
+  items.field_518                   AS 'Цена розн.$',       -- E45.f518
+  items.field_425                   AS 'Цена',              -- Цена продаж
   ROUND(
     CAST(items.field_424 AS DECIMAL(18,6)) *
     CAST(items.field_425 AS DECIMAL(18,6))
-  ,2)                               AS 'Сумма'
+  ,2)                               AS 'Сумма',
+  items.field_557                   AS 'Сумма (-)'          -- E45.f557
 FROM
   (SELECT @rownum:=0) r,
   app_entity_45 items
