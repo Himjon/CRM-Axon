@@ -1,0 +1,263 @@
+/**
+ * Whole&Retail — Учёт кассы (E32) и оптовых долгов (E30) по движениям E36 (ДДС)
+ * Поля E36:
+ *  - f428 касса, f429 тип (53/54), f430 сумма, f431 основание, f512 клиент (опт)
+ * Кэши:
+ *  - f493 p_cache_cash_id, f494 p_cache_type_id, f495 p_cache_amount
+ *  - f528 p_debt_client_cache, f529 p_debt_type_cache (кэш f431), f530 p_debt_amount_cache
+ * Долг (E30/f407): reason=73 (приход) ↓ долг; reason=74 (расход) ↑ долг
+ */
+class WRCash36
+{
+  /* === поля E36 === */
+  const CASH_FIELD   = 428;
+  const TYPE_FIELD   = 429;
+  const AMOUNT_FIELD = 430;
+  const REASON_FIELD = 431;
+  const CLIENT_FIELD = 512;   // клиент (опт)
+
+  /* === кэш E36 (касса) === */
+  const CACHE_CASH   = 493;
+  const CACHE_TYPE   = 494;
+  const CACHE_AMOUNT = 495;
+
+  /* === кэш E36 (долг) === */
+  const DEBT_CLI_CACHE   = 528; // кэш клиента
+  const DEBT_TYPE_CACHE  = 529; // кэш основания f431
+  const DEBT_AMT_CACHE   = 530; // кэш суммы для долга
+
+  /* === поля E32/E30 === */
+  const E32_BAL = 399;   // касса: остаток
+  const E32_TS  = 466;   // касса: время изменения
+  const E30_DEBT= 407;   // клиент: задолженность
+
+  /* === причины долгов === */
+  const REASON_OPT_PAY    = 73; // «Оплата от оптового клиента» (приход → долг уменьшаем)
+  const REASON_OPT_REFUND = 74; // «Возврат денег оптовику»     (расход → долг увеличиваем)
+
+  /* === базовые помощники === */
+  protected static function now(): int { return time(); }
+  protected static function sign(int $type): int { return ($type===53?+1:($type===54?-1:0)); }
+  protected static function fmt($x): string { return number_format((float)$x,2,'.',' '); }
+  protected static function alert($m,$t='error'){ if(isset($GLOBALS['alerts'])) $GLOBALS['alerts']->add($m,$t); }
+
+  protected static function curId(): int {
+    $id=0;
+    foreach(['items_id','id'] as $k){
+      if(!$id && isset($_POST[$k]))   $id=(int)$_POST[$k];
+      if(!$id && isset($_GET[$k]))    $id=(int)$_GET[$k];
+      if(!$id && isset($GLOBALS[$k])) $id=(int)$GLOBALS[$k];
+    }
+    if(!$id){
+      $p=$_REQUEST['path'] ?? ($GLOBALS['app_path'] ?? '');
+      if($p && preg_match('~(?:^|/)36-(\d+)(?:/|$)~',$p,$m)) $id=(int)$m[1];
+    }
+    if(!$id){
+      $uid=(int)($GLOBALS['app_user']['id'] ?? ($_SESSION['app_logged_users_id'] ?? 0));
+      $r=db_fetch_array(db_query("
+        SELECT id FROM app_entity_36
+        WHERE ".($uid?"created_by={$uid} AND ":"")."date_added>=UNIX_TIMESTAMP(NOW())-300
+        ORDER BY id DESC LIMIT 1
+      "));
+      if($r) $id=(int)$r['id'];
+    }
+    return $id>0?$id:0;
+  }
+
+  /* === чтение строки E36 + кэши === */
+  protected static function row36(int $id){
+    if($id<=0) return null;
+    return db_fetch_array(db_query("
+      SELECT id,
+             field_".self::CASH_FIELD."   AS cash_id,
+             field_".self::TYPE_FIELD."   AS type_id,
+             field_".self::AMOUNT_FIELD." AS amount,
+             field_".self::REASON_FIELD." AS reason_id,
+             field_".self::CLIENT_FIELD." AS client_id,
+             field_".self::CACHE_CASH."   AS cache_cash,
+             field_".self::CACHE_TYPE."   AS cache_type,
+             field_".self::CACHE_AMOUNT." AS cache_amount,
+             field_".self::DEBT_CLI_CACHE."  AS debt_cli_cache,
+             field_".self::DEBT_TYPE_CACHE." AS debt_type_cache,
+             field_".self::DEBT_AMT_CACHE."  AS debt_amt_cache
+      FROM app_entity_36 WHERE id={$id} LIMIT 1
+    "));
+  }
+
+  protected static function updateCashCache36(int $id,int $cash,int $type,float $amt): void {
+    db_query("UPDATE app_entity_36 SET
+                field_".self::CACHE_CASH."   = {$cash},
+                field_".self::CACHE_TYPE."   = {$type},
+                field_".self::CACHE_AMOUNT." = ".(float)$amt."
+              WHERE id={$id} LIMIT 1");
+  }
+  protected static function updateDebtCache36(int $id,int $client,int $reason,float $amt): void {
+    db_query("UPDATE app_entity_36 SET
+                field_".self::DEBT_CLI_CACHE."  = {$client},
+                field_".self::DEBT_TYPE_CACHE." = {$reason},
+                field_".self::DEBT_AMT_CACHE."  = ".(float)$amt."
+              WHERE id={$id} LIMIT 1");
+  }
+
+  /* === касса: атомарный апдейт === */
+  protected static function applyCashDelta(int $cash_id,float $delta): bool {
+    if($cash_id<=0 || abs($delta)<1e-9) return true;
+    $now=self::now();
+    if($delta>=0){
+      db_query("
+        UPDATE app_entity_32
+           SET field_".self::E32_BAL."=(field_".self::E32_BAL."+0)+({$delta}),
+               field_".self::E32_TS."={$now}
+         WHERE id={$cash_id} LIMIT 1
+      ");
+      return true;
+    }else{
+      $need=abs($delta);
+      db_query("
+        UPDATE app_entity_32
+           SET field_".self::E32_BAL."=(field_".self::E32_BAL."+0)-{$need},
+               field_".self::E32_TS."={$now}
+         WHERE id={$cash_id} AND (field_".self::E32_BAL."+0)>={$need}
+         LIMIT 1
+      ");
+      if(function_exists('db_affected_rows')) return db_affected_rows()>0;
+      return true;
+    }
+  }
+
+  /* === долг: временно отключено (field_407 больше не трогаем) === */
+  protected static function debtDeltaBy(int $type,int $reason,float $amount): float {
+    return 0.0;
+  }
+
+    /* === долг: временно отключено (field_407 больше не трогаем) === */
+  protected static function applyDebt(int $client_id,float $delta): void {
+    // Ничего не делаем: 407 теперь только "фото" из 1С
+    return;
+  }
+
+  /* ===== INSERT ===== */
+  public static function afterInsert(): void {
+    $rid=self::curId(); if($rid<=0) return;
+    $r=self::row36($rid); if(!$r) return;
+
+    $cash=(int)$r['cash_id'];
+    $type=(int)$r['type_id'];
+    $amt =(float)$r['amount'];
+    $rsn =(int)$r['reason_id'];
+    $cli =(int)$r['client_id'];
+    $sgn=self::sign($type);
+    if($cash<=0 || $amt<=0 || $sgn===0) return;
+
+    // касса
+    $ok=self::applyCashDelta($cash,$sgn*$amt);
+    if(!$ok){
+      db_query("DELETE FROM app_entity_36 WHERE id={$rid} LIMIT 1");
+      self::alert('Недостаточно средств в кассе. Операция отменена.');
+      return;
+    }
+    self::updateCashCache36($rid,$cash,$type,$amt);
+
+    // долг
+    $dd=self::debtDeltaBy($type,$rsn,$amt);
+    if(abs($dd)>1e-9 && $cli>0){
+      self::applyDebt($cli,$dd);
+    }
+    self::updateDebtCache36($rid,$cli,$rsn,$amt);
+  }
+
+  /* ===== UPDATE ===== */
+  public static function afterUpdate(): void {
+    $rid=self::curId(); if($rid<=0) return;
+    $r=self::row36($rid); if(!$r) return;
+
+    // новые
+    $n_cash=(int)$r['cash_id'];
+    $n_type=(int)$r['type_id'];
+    $n_amt =(float)$r['amount'];
+    $n_rsn =(int)$r['reason_id'];
+    $n_cli =(int)$r['client_id'];
+    $n_sgn=self::sign($n_type);
+
+    // старые (из кэша)
+    $o_cash=(int)($r['cache_cash']??0);
+    $o_type=(int)($r['cache_type']??0);
+    $o_amt =(float)($r['cache_amount']??0);
+    $o_cli =(int)($r['debt_cli_cache']??0);
+    $o_rsn =(int)($r['debt_type_cache']??0);  // это кэш f431
+    $o_sgn=self::sign($o_type);
+
+    // 1) откат кассы
+    if($o_cash>0 && $o_amt>0 && $o_sgn!==0){
+      $ok=self::applyCashDelta($o_cash,-($o_sgn*$o_amt));
+      if(!$ok){
+        self::alert('Не удалось откатить прошлое движение по кассе. Изменения отменены.');
+        db_perform('app_entity_36',[
+          'field_'.self::CASH_FIELD   => $o_cash,
+          'field_'.self::TYPE_FIELD   => $o_type,
+          'field_'.self::AMOUNT_FIELD => $o_amt,
+          'field_'.self::REASON_FIELD => $o_rsn,
+          'field_'.self::CLIENT_FIELD => $o_cli,
+        ],'update',"id={$rid}");
+        return;
+      }
+    }
+    // 2) откат долга
+    $dd_old=self::debtDeltaBy($o_type,$o_rsn,$o_amt);
+    if(abs($dd_old)>1e-9 && $o_cli>0) self::applyDebt($o_cli,-$dd_old);
+
+    // 3) применить новые
+    if($n_cash>0 && $n_amt>0 && $n_sgn!==0){
+      $ok=self::applyCashDelta($n_cash,$n_sgn*$n_amt);
+      if(!$ok){
+        // вернём старое влияние по кассе
+        if($o_cash>0 && $o_amt>0 && $o_sgn!==0) self::applyCashDelta($o_cash,$o_sgn*$o_amt);
+        // вернём поля
+        db_perform('app_entity_36',[
+          'field_'.self::CASH_FIELD   => $o_cash,
+          'field_'.self::TYPE_FIELD   => $o_type,
+          'field_'.self::AMOUNT_FIELD => $o_amt,
+          'field_'.self::REASON_FIELD => $o_rsn,
+          'field_'.self::CLIENT_FIELD => $o_cli,
+        ],'update',"id={$rid}");
+        self::alert('Недостаточно средств. Изменения отменены.');
+        return;
+      }
+    }
+    $dd_new=self::debtDeltaBy($n_type,$n_rsn,$n_amt);
+    if(abs($dd_new)>1e-9 && $n_cli>0) self::applyDebt($n_cli,$dd_new);
+
+    // 4) обновить кэши
+    self::updateCashCache36($rid,$n_cash,$n_type,$n_amt);
+    self::updateDebtCache36($rid,$n_cli,$n_rsn,$n_amt);
+  }
+
+  /* ===== BEFORE DELETE (пакет/одиночно) ===== */
+  public static function beforeDelete(): void {
+    $bulk=[];
+    if(!empty($_POST['selected_items'])) $bulk=array_merge($bulk,(array)$_POST['selected_items']);
+    if(!empty($_GET['selected_items']))  $bulk=array_merge($bulk,(array)$_GET['selected_items']);
+    $bulk=array_values(array_filter(array_map('intval',$bulk),fn($x)=>$x>0));
+    if($bulk){ foreach($bulk as $rid) self::reverseOne($rid); return; }
+
+    $rid=self::curId(); if($rid>0) self::reverseOne($rid);
+  }
+
+  protected static function reverseOne(int $rid): void {
+    $r=self::row36($rid); if(!$r) return;
+
+    // касса — берём из кэша, если нет — из текущих полей
+    $cash=(int)($r['cache_cash']??$r['cash_id']);
+    $type=(int)($r['cache_type']??$r['type_id']);
+    $amt =(float)($r['cache_amount']??$r['amount']);
+    $sgn=self::sign($type);
+    if($cash>0 && $amt>0 && $sgn!==0) self::applyCashDelta($cash,-($sgn*$amt));
+
+    // долг — из debt-кэшей (или текущих при их отсутствии)
+    $cli=(int)($r['debt_cli_cache']??$r['client_id']);
+    $rsn=(int)($r['debt_type_cache']??$r['reason_id']);
+    $damt=(float)($r['debt_amt_cache']??$r['amount']);
+    $dd=self::debtDeltaBy($type,$rsn,$damt);
+    if(abs($dd)>1e-9 && $cli>0) self::applyDebt($cli,-$dd);
+  }
+}
